@@ -1,0 +1,206 @@
+#!/bin/sh
+
+### There are two modes this source code is working in (as a result two corresponding scripts are produced):
+### 1. one-click-installer - always installs the latest available version of Plesk for an environment, where the installer was executed
+### 2. plesk-installer - just transparently for a user downloads autoinstaller binary, which corresponds to an environment, where the installer was executed
+### 'current_mode' is defined on building stage to produce two scripts from one source
+current_mode="plesk-installer"
+
+argv=$@
+
+set -efu
+
+die()
+{
+	echo "ERROR: $*" >&2
+	exit 1
+}
+
+verbose()
+{
+	if [ -n "$verbose" ]; then
+		echo "$@" >&2
+	fi
+}
+
+check_root()
+{
+	if [ `id -u` -ne 0 ]; then
+		die "You should have superuser privileges to install Plesk"
+	fi
+}
+
+check_for_upgrade()
+{
+	local prefix
+	local version=
+	for prefix in /opt/psa /usr/local/psa; do
+		if [ -e "$prefix/version" ]; then
+			version=`cat $prefix/version |  awk '{ print $1 }'`
+			break
+		elif [ -f "$prefix/core.version" ]; then
+			version=`cat $prefix/core.version |  awk '{ print $1 }'`
+			break
+		fi
+	done
+
+	if [ -n "$version" ]; then
+		echo "You have Plesk v $version installed."
+		if [ "$current_mode" = "one-click-installer" ]; then
+			### we should stop installation of the latest available version if some Plesk version is already installed
+			echo "Please, use Parallels Installer from Web Interface or CLI (can be downloaded from http://autoinstall.plesk.com/plesk-installer)"
+			exit 0
+		fi
+	fi
+}
+
+fetch_file()
+{
+	local url=$1
+	local target=$2
+
+	if [ -x "/usr/bin/wget" ]; then
+		cmd="/usr/bin/wget -q $url -O $target"
+	elif [ -x "/usr/bin/curl" ]; then
+		cmd="/usr/bin/curl $url -o $target"
+	elif [ -x "/usr/bin/fetch" ]; then
+		cmd="/usr/bin/fetch -o $target $url"
+	else
+		die "Unable to find download manager(fetch, wget, curl)"
+	fi
+
+	verbose "Transport command is $cmd"
+
+	if ! $cmd; then
+		die "Unable to run Parallels Installer. Possible reasons:
+1) You are trying to run Parallels Installer on an unsupported OS. Your OS is $os_name-$os_version. The list of supported OS is at http://www.parallels.com/products/plesk/requirements/
+2) Temporary network problem. Check your connection to autoinstall.plesk.com, contact your provider or open a support ticket."
+	fi
+}
+
+fetch_autoinstaller()
+{
+	if [ -z "${1:-}" ]; then
+		ai_dest="/root/parallels_installer"
+	fi
+
+	rm -f "$ai_dest" >/dev/null 2>&1
+	fetch_file "http://autoinstall.plesk.com/Parallels_Installer/$ai_name" "$ai_dest"
+	chmod 0700 "$ai_dest"
+}
+
+get_os_info()
+{
+	[ -e '/bin/uname' ] && uname='/bin/uname' || uname='/usr/bin/uname'
+	arch=`uname -m`
+	local os_sn
+
+	case $arch in
+		i?86) arch="i386" ;;
+		*) : ;;
+	esac
+
+	opsys=`uname -s`
+	if [ "$opsys" = 'Linux' ]; then
+		if [ -e '/etc/debian_version' ]; then
+			if [ -e '/etc/lsb-release' ]; then
+				# Mostly ubuntu, but debian can have it
+				. /etc/lsb-release
+				os_name=$DISTRIB_ID
+				os_version=$DISTRIB_RELEASE
+			else
+				os_name='Debian'
+				os_version=`head -1 /etc/debian_version`
+			fi
+			case $os_name in
+				Debian) 
+					os_version=`echo $os_version | grep -o "^[0-9]\+"`
+					[ -z "$os_version" ] || os_version="$os_version.0"
+					;;
+				Ubuntu) 
+					;;
+				*) 
+					die "Unknown OS: $os_name-$os_version-$arch"
+					;;
+			esac
+		elif [ -e '/etc/SuSE-release' ]; then
+			os_name='SuSE'
+			os_version=`head -1 /etc/SuSE-release | sed -e 's/[^0-9.]*\([0-9.]*\).*/\1/g'`
+			if grep -q 'Enterprise Server' /etc/SuSE-release; then
+				os_version="es$os_version"
+			fi
+		elif [ -e '/etc/fedora-release' ]; then
+			os_name='FedoraCore'
+			os_version=`head -1 /etc/fedora-release | sed -e 's/[^0-9.]*\([0-9.]*\).*/\1/g'`
+		elif [ -e '/etc/redhat-release' ]; then
+			os_name=`awk '{print $1}' /etc/redhat-release`
+			os_version=`head -1 /etc/redhat-release | sed -e 's/[^0-9.]*\([0-9.]*\).*/\1/g'`
+# for rh based os get only major
+			os_version=`echo $os_version | awk -F'.' '{print $1}'`
+			case $os_name$os_version$arch in
+				CentOS4*i386) os_version="4.2" ;;
+				CentOS4*x86_64) os_version="4.3" ;;
+				CentOS*|Cloud*) os_version=`echo $os_version | awk -F'.' '{print $1}'` ;;
+				Red*) os_name="RedHat"; os_version="el`echo $os_version | awk -F'.' '{print $1}'`" ;;
+				*) die "Unknown OS: $os_name-$os_version-$arch" ;;
+			esac
+		else
+			die "Unable to detect OS"
+		fi
+	elif [ "$opsys" = 'FreeBSD' ]; then
+		os_name='FreeBSD'
+		os_version=`$uname -r | sed -e 's/[^0-9.]*\([0-9.]*\).*/\1/g'`
+	else
+		die "Unable to detect OS"
+	fi
+
+	[ -n "$os_name" ]    || die "Unable to detect OS"
+	[ -n "$os_version" ] || die "Unable to detect $os_name OS version"
+	[ -n "$arch" ]       || die "Unable to detect system architecture"
+
+	verbose "Detected os $os_name-$os_version-$arch"
+}
+
+verbose=
+dry_run=
+os_name=
+os_version=
+arch=
+
+# getopts is not capable of parsing GNU-style long options (arguments passed to AI)
+if [ "$current_mode" = "one-click-installer" ]; then
+	while getopts "vn" Option; do
+		case $Option in
+			v) verbose=1 ;;
+			n) dry_run=1 ;;
+			?) ;;	# Already reported by getopts
+			*) verbose "Unknown option $Option, skipping" ;;
+		esac
+	done
+	shift $(($OPTIND - 1)); OPTIND=1
+fi
+
+check_root
+check_for_upgrade
+
+get_os_info
+
+ai_name="parallels_installer_${os_name}_${os_version}_${arch}"
+ai_dest='/root/parallels_installer'
+fetch_autoinstaller "$ai_name" "$ai_dest"
+
+
+if [ "$current_mode" = "one-click-installer" ]; then
+	ai_cmd="$ai_dest --select-product-id=plesk --select-release-latest --branch=release,stable --installation-type=Typical"
+else
+	ai_cmd="$ai_dest $argv"
+fi
+
+
+
+if [ -n "$dry_run" ]; then
+	verbose "Follwing command will run: $ai_cmd"
+	rm -f $ai_dest
+else
+	exec $ai_cmd
+fi
